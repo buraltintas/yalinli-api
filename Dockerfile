@@ -6,6 +6,7 @@ COPY . .
 RUN go build -o /bin/api ./cmd/api
 
 FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata && update-ca-certificates
 RUN adduser -D appuser
 USER appuser
 WORKDIR /app
