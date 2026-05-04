@@ -24,11 +24,13 @@ func main() {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	listenAddr := ":" + cfg.Port
+	emailEnabled := cfg.SMTPHost != ""
 	logger.Info("startup begin",
 		"app_env", cfg.AppEnv,
 		"port", cfg.Port,
 		"listen_addr", listenAddr,
 		"storage_backend", cfg.StorageBackend,
+		"email_enabled", emailEnabled,
 	)
 	logger.Info("database connect attempt started")
 	pool, err := db.Open(context.Background(), cfg.DatabaseURL)

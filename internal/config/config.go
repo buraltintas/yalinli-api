@@ -106,8 +106,20 @@ func Load() (Config, error) {
 		RateLimitOTPPerMin:       parseIntDefault("RATE_LIMIT_OTP_PER_MIN", 1),
 		RateLimitOTPPerDay:       parseIntDefault("RATE_LIMIT_OTP_PER_DAY", 10),
 	}
-	if cfg.DatabaseURL == "" || cfg.BFFSecret == "" || cfg.JWTSecret == "" || cfg.SignatureHashSecret == "" {
-		return Config{}, fmt.Errorf("DATABASE_URL, BFF_SECRET, JWT_SECRET and SIGNATURE_HASH_SECRET are required")
+	if err := requireEnv("DATABASE_URL", cfg.DatabaseURL); err != nil {
+		return Config{}, err
+	}
+	if err := requireEnv("BFF_SECRET", cfg.BFFSecret); err != nil {
+		return Config{}, err
+	}
+	if err := requireEnv("JWT_SECRET", cfg.JWTSecret); err != nil {
+		return Config{}, err
+	}
+	if err := requireEnv("SIGNATURE_HASH_SECRET", cfg.SignatureHashSecret); err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(cfg.Port) == "" {
+		cfg.Port = "8080"
 	}
 	if cfg.StorageBackend == "gcs" {
 		if cfg.GCSBucket == "" {
@@ -130,6 +142,12 @@ func getDefault(k, d string) string {
 		return v
 	}
 	return d
+}
+func requireEnv(name, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	return nil
 }
 func parseIntDefault(k string, d int) int {
 	v := strings.TrimSpace(os.Getenv(k))
