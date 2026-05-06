@@ -876,11 +876,11 @@ func (s *Server) handlePetitions() http.HandlerFunc {
 func (s *Server) handlePetition() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
-		row := s.db.QueryRow(r.Context(), `SELECT p.id,e.title,e.description,p.signature_count,p.status,e.created_at FROM petitions p JOIN entries e ON e.id=p.entry_id WHERE p.id=$1 AND p.status IN ('approved','closed')`, id)
-		var pid, title, desc, status string
+		row := s.db.QueryRow(r.Context(), `SELECT p.id,e.title,e.description,p.signature_count,p.status,e.created_at,p.created_by FROM petitions p JOIN entries e ON e.id=p.entry_id WHERE p.id=$1 AND p.status IN ('approved','closed')`, id)
+		var pid, title, desc, status, createdBy string
 		var count int
 		var created time.Time
-		if err := row.Scan(&pid, &title, &desc, &count, &status, &created); err != nil {
+		if err := row.Scan(&pid, &title, &desc, &count, &status, &created, &createdBy); err != nil {
 			response.Error(w, http.StatusNotFound, "not_found", "not found")
 			return
 		}
@@ -897,10 +897,12 @@ func (s *Server) handlePetition() http.HandlerFunc {
 			}
 		}
 		var viewerSigned bool
+		var isOwner bool
 		if uid, ok := middleware.UserIDFrom(r.Context()); ok {
 			_ = s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM petition_signatures WHERE petition_id=$1 AND user_id=$2)`, pid, uid).Scan(&viewerSigned)
+			isOwner = uid == createdBy
 		}
-		response.JSON(w, http.StatusOK, map[string]any{"id": pid, "title": title, "description": desc, "signatureCount": count, "status": status, "createdAt": created, "maskedSigners": masked, "viewerSigned": viewerSigned})
+		response.JSON(w, http.StatusOK, map[string]any{"id": pid, "title": title, "description": desc, "signatureCount": count, "status": status, "createdAt": created, "maskedSigners": masked, "viewerSigned": viewerSigned, "isOwner": isOwner})
 	}
 }
 func (s *Server) handleSignPetition() http.HandlerFunc {
