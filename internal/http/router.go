@@ -166,12 +166,7 @@ func (s *Server) issueCode(ctx context.Context, emailAddr, purpose, lang string)
 	hashed, _ := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
 	expires := time.Now().UTC().Add(time.Duration(s.cfg.OTPCodeTTLMinutes) * time.Minute)
 	_, _ = s.db.Exec(ctx, `INSERT INTO auth_codes(email,purpose,code_hash,expires_at,max_attempts) VALUES($1,$2,$3,$4,$5)`, emailAddr, purpose, string(hashed), expires, s.cfg.OTPMaxAttempts)
-	sub := map[string]string{"tr": "Yalınlı giriş kodunuz", "en": "Your Yalinli login code"}[lang]
-	if sub == "" {
-		sub = "Yalınlı giriş kodunuz"
-	}
-	body := fmt.Sprintf("Code: %s\nThis code expires in %d minutes.", code, s.cfg.OTPCodeTTLMinutes)
-	s.emails.SendAsync(ctx, emailAddr, sub, body)
+	s.emails.SendAsync(ctx, emailAddr, email.LoginCodeSubject(lang), email.LoginCodeBody(lang, code, s.cfg.OTPCodeTTLMinutes))
 }
 
 func (s *Server) handleVerifyCode() http.HandlerFunc {

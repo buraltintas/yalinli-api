@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"strings"
+	"time"
 )
 
 type Sender interface {
@@ -46,7 +49,9 @@ func (s *Service) worker() {
 	for j := range s.jobs {
 		if err := s.SendSync(j.to, j.subject, j.body); err != nil {
 			s.logger.Error("email send failed", "to", j.to, "error", err.Error())
+			continue
 		}
+		s.logger.Info("email sent successfully", "to", j.to, "subject", j.subject)
 	}
 }
 
@@ -60,23 +65,29 @@ func (s *Service) SendSync(to, subject, body string) error {
 	if strings.TrimSpace(s.password) == "" {
 		return errors.New("SMTP_PASSWORD is empty")
 	}
-	fromHeader := strings.TrimSpace(s.from)
-	if fromHeader == "" {
-		fromHeader = strings.TrimSpace(s.username)
+	fromAddr := strings.TrimSpace(s.from)
+	if fromAddr == "" {
+		fromAddr = strings.TrimSpace(s.username)
 	}
 	replyTo := ""
-	if fromHeader != s.username && !strings.Contains(strings.ToLower(fromHeader), strings.ToLower(s.username)) {
-		replyTo = fromHeader
+	if fromAddr != s.username && !strings.Contains(strings.ToLower(fromAddr), strings.ToLower(s.username)) {
+		replyTo = fromAddr
 	}
+	fromHeader := (&mail.Address{Name: strings.TrimSpace(s.fromName), Address: fromAddr}).String()
 	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("From: %s <%s>\r\n", s.fromName, fromHeader))
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", fromHeader))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
 	if replyTo != "" {
 		msg.WriteString(fmt.Sprintf("Reply-To: %s\r\n", replyTo))
 	}
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", mime.QEncoding.Encode("utf-8", subject)))
+	msg.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
+	msg.WriteString(fmt.Sprintf("Message-ID: <%d.%s@yalinli.org>\r\n", time.Now().UnixNano(), sanitizeMessageIDLocal(to)))
+	msg.WriteString("Auto-Submitted: auto-generated\r\n")
+	msg.WriteString("X-Auto-Response-Suppress: All\r\n")
 	msg.WriteString("MIME-Version: 1.0\r\n")
 	msg.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
 	msg.WriteString("\r\n")
 	msg.WriteString(body)
 
@@ -135,4 +146,17 @@ func (s *Service) SendSync(to, subject, body string) error {
 		return fmt.Errorf("SMTP QUIT failed: %w", err)
 	}
 	return nil
+}
+
+func sanitizeMessageIDLocal(v string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(v)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "mail"
+	}
+	return b.String()
 }
