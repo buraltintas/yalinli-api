@@ -112,7 +112,12 @@ func lang(r *http.Request) string { return middleware.LangFrom(r.Context()) }
 func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Email string `json:"email"`
+			Email                     string  `json:"email"`
+			FullName                  string  `json:"fullName"`
+			Name                      string  `json:"name"`
+			DisplayName               *string `json:"displayName"`
+			PreferredLanguage         string  `json:"preferredLanguage"`
+			EmailNotificationsEnabled *bool   `json:"emailNotificationsEnabled"`
 		}
 		if !decodeJSON(w, r, &in) {
 			return
@@ -122,17 +127,37 @@ func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 			badInput(w, r, "invalid_input")
 			return
 		}
+		fullName := strings.TrimSpace(in.FullName)
+		if fullName == "" {
+			fullName = strings.TrimSpace(in.Name)
+		}
+		if fullName == "" || len([]rune(fullName)) > 160 {
+			badInput(w, r, "invalid_input")
+			return
+		}
+		preferredLanguage := strings.TrimSpace(in.PreferredLanguage)
+		if preferredLanguage == "" {
+			preferredLanguage = s.cfg.DefaultLanguage
+		}
+		if !validation.ValidLang(preferredLanguage) {
+			badInput(w, r, "invalid_input")
+			return
+		}
+		emailNotificationsEnabled := true
+		if in.EmailNotificationsEnabled != nil {
+			emailNotificationsEnabled = *in.EmailNotificationsEnabled
+		}
 		var exists bool
 		_ = s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM users WHERE email=$1)`, em).Scan(&exists)
 		if exists {
 			response.Error(w, http.StatusConflict, "user_already_exists", i18n.Message(lang(r), "user_already_exists"))
 			return
 		}
-		if _, err := s.db.Exec(r.Context(), `INSERT INTO users(email,preferred_language) VALUES ($1,'tr') ON CONFLICT DO NOTHING`, em); err != nil {
+		if _, err := s.db.Exec(r.Context(), `INSERT INTO users(email,full_name,display_name,preferred_language,email_notifications_enabled) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, em, fullName, in.DisplayName, preferredLanguage, emailNotificationsEnabled); err != nil {
 			internalErr(w, r)
 			return
 		}
-		s.issueCode(r.Context(), em, "signup", lang(r))
+		s.issueCode(r.Context(), em, "signup", preferredLanguage)
 		response.JSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -255,15 +280,21 @@ func (s *Server) handleLogout() http.HandlerFunc {
 func (s *Server) handleMe() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := middleware.UserIDFrom(r.Context())
-		row := s.db.QueryRow(r.Context(), `SELECT id,email,display_name,preferred_language,email_notifications_enabled,notify_new_entries,notify_resolved_problems,notify_new_petitions,notify_new_events,notify_announcements FROM users WHERE id=$1`, uid)
+		row := s.db.QueryRow(r.Context(), `SELECT id,email,full_name,display_name,preferred_language,email_notifications_enabled,notify_new_entries,notify_resolved_problems,notify_new_petitions,notify_new_events,notify_announcements FROM users WHERE id=$1`, uid)
 		var out struct {
-			ID, Email                                                                                          string
-			DisplayName                                                                                        *string
-			PreferredLanguage                                                                                  string
-			EmailNotificationsEnabled                                                                          bool
-			NotifyNewEntries, NotifyResolvedProblems, NotifyNewPetitions, NotifyNewEvents, NotifyAnnouncements bool
+			ID                        string  `json:"id"`
+			Email                     string  `json:"email"`
+			FullName                  *string `json:"fullName"`
+			DisplayName               *string `json:"displayName"`
+			PreferredLanguage         string  `json:"preferredLanguage"`
+			EmailNotificationsEnabled bool    `json:"emailNotificationsEnabled"`
+			NotifyNewEntries          bool    `json:"notifyNewEntries"`
+			NotifyResolvedProblems    bool    `json:"notifyResolvedProblems"`
+			NotifyNewPetitions        bool    `json:"notifyNewPetitions"`
+			NotifyNewEvents           bool    `json:"notifyNewEvents"`
+			NotifyAnnouncements       bool    `json:"notifyAnnouncements"`
 		}
-		if err := row.Scan(&out.ID, &out.Email, &out.DisplayName, &out.PreferredLanguage, &out.EmailNotificationsEnabled, &out.NotifyNewEntries, &out.NotifyResolvedProblems, &out.NotifyNewPetitions, &out.NotifyNewEvents, &out.NotifyAnnouncements); err != nil {
+		if err := row.Scan(&out.ID, &out.Email, &out.FullName, &out.DisplayName, &out.PreferredLanguage, &out.EmailNotificationsEnabled, &out.NotifyNewEntries, &out.NotifyResolvedProblems, &out.NotifyNewPetitions, &out.NotifyNewEvents, &out.NotifyAnnouncements); err != nil {
 			internalErr(w, r)
 			return
 		}
@@ -274,6 +305,8 @@ func (s *Server) handlePatchMe() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := middleware.UserIDFrom(r.Context())
 		var in struct {
+			FullName                  *string `json:"fullName"`
+			Name                      *string `json:"name"`
 			DisplayName               *string `json:"displayName"`
 			PreferredLanguage         *string `json:"preferredLanguage"`
 			EmailNotificationsEnabled *bool   `json:"emailNotificationsEnabled"`
@@ -285,7 +318,15 @@ func (s *Server) handlePatchMe() http.HandlerFunc {
 			badInput(w, r, "invalid_input")
 			return
 		}
-		_, err := s.db.Exec(r.Context(), `UPDATE users SET display_name=COALESCE($2,display_name), preferred_language=COALESCE($3,preferred_language), email_notifications_enabled=COALESCE($4,email_notifications_enabled), updated_at=now() WHERE id=$1`, uid, in.DisplayName, in.PreferredLanguage, in.EmailNotificationsEnabled)
+		fullName := in.FullName
+		if fullName == nil {
+			fullName = in.Name
+		}
+		if fullName != nil && (strings.TrimSpace(*fullName) == "" || len([]rune(strings.TrimSpace(*fullName))) > 160) {
+			badInput(w, r, "invalid_input")
+			return
+		}
+		_, err := s.db.Exec(r.Context(), `UPDATE users SET full_name=COALESCE($2,full_name), display_name=COALESCE($3,display_name), preferred_language=COALESCE($4,preferred_language), email_notifications_enabled=COALESCE($5,email_notifications_enabled), updated_at=now() WHERE id=$1`, uid, fullName, in.DisplayName, in.PreferredLanguage, in.EmailNotificationsEnabled)
 		if err != nil {
 			internalErr(w, r)
 			return
