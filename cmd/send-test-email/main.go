@@ -33,7 +33,8 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	svc := email.NewService(logger, cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.EmailFrom, cfg.EmailFromName)
 
-	if err := svc.SendSync(strings.TrimSpace(*to), email.TestEmailSubject(), email.TestEmailBody()); err != nil {
+	content := email.TestEmailContent(cfg.PublicSiteURL, cfg.PublicSiteName)
+	if err := svc.SendSync(strings.TrimSpace(*to), email.TestEmailSubject(), content); err != nil {
 		fmt.Fprintf(os.Stderr, "send failed: %v\n", err)
 		os.Exit(1)
 	}

@@ -241,7 +241,8 @@ func (s *Server) issueCode(ctx context.Context, emailAddr, purpose, lang string)
 	if _, err := s.db.Exec(ctx, `INSERT INTO auth_codes(email,purpose,code_hash,expires_at,max_attempts) VALUES($1,$2,$3,$4,$5)`, emailAddr, purpose, string(hashed), expires, s.cfg.OTPMaxAttempts); err != nil {
 		return err
 	}
-	s.emails.SendAsync(ctx, emailAddr, email.LoginCodeSubject(lang), email.LoginCodeBody(lang, code, s.cfg.OTPCodeTTLMinutes))
+	content := email.LoginCodeContent(lang, code, s.cfg.OTPCodeTTLMinutes, s.cfg.PublicSiteURL, s.cfg.PublicSiteName)
+	s.emails.SendAsync(ctx, emailAddr, email.LoginCodeSubject(lang), content)
 	return nil
 }
 
@@ -485,6 +486,9 @@ func (s *Server) handleCreateEntry() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
+		if status == "approved" {
+			s.notifyNewEntry(r.Context(), id, in.Title, in.Description, userID)
+		}
 		response.JSON(w, http.StatusCreated, map[string]any{"id": id, "status": status})
 	}
 }
@@ -657,8 +661,72 @@ func (s *Server) handleCreateComment() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
+		if status == "approved" {
+			s.notifyEntryComment(r.Context(), eid, in.Body, userID)
+		}
 		response.JSON(w, http.StatusCreated, map[string]any{"id": cid, "status": status})
 	}
+}
+
+func (s *Server) notifyNewEntry(ctx context.Context, entryID, title, description string, authorUserID *string) {
+	entryURL := s.entryURL(entryID)
+	authorEmail := ""
+	if authorUserID != nil {
+		_ = s.db.QueryRow(ctx, `SELECT email FROM users WHERE id=$1`, *authorUserID).Scan(&authorEmail)
+	}
+	rows, err := s.db.Query(ctx, `SELECT email, preferred_language FROM users WHERE email_notifications_enabled=true AND notify_new_entries=true`)
+	if err != nil {
+		s.logger.Error("notify new entry query failed", "error", err.Error())
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var emailAddr, preferredLanguage string
+		if err := rows.Scan(&emailAddr, &preferredLanguage); err != nil {
+			continue
+		}
+		if emailAddr == "" || (authorEmail != "" && strings.EqualFold(emailAddr, authorEmail)) {
+			continue
+		}
+		if strings.TrimSpace(preferredLanguage) == "" {
+			preferredLanguage = s.cfg.DefaultLanguage
+		}
+		content := email.NewEntryContent(preferredLanguage, title, description, entryURL, s.cfg.PublicSiteURL, s.cfg.PublicSiteName)
+		s.emails.SendAsync(ctx, emailAddr, email.NewEntrySubject(preferredLanguage), content)
+	}
+	if err := rows.Err(); err != nil {
+		s.logger.Error("notify new entry row scan failed", "error", err.Error())
+	}
+}
+
+func (s *Server) notifyEntryComment(ctx context.Context, entryID, commentBody string, commenterUserID *string) {
+	var ownerID, ownerEmail, ownerLang, entryTitle string
+	var emailEnabled bool
+	err := s.db.QueryRow(ctx, `SELECT u.id,u.email,u.preferred_language,u.email_notifications_enabled,e.title FROM entries e JOIN users u ON u.id=e.user_id WHERE e.id=$1`, entryID).
+		Scan(&ownerID, &ownerEmail, &ownerLang, &emailEnabled, &entryTitle)
+	if err != nil {
+		return
+	}
+	if !emailEnabled || strings.TrimSpace(ownerEmail) == "" {
+		return
+	}
+	if commenterUserID != nil && *commenterUserID == ownerID {
+		return
+	}
+	if strings.TrimSpace(ownerLang) == "" {
+		ownerLang = s.cfg.DefaultLanguage
+	}
+	entryURL := s.entryURL(entryID)
+	content := email.NewCommentContent(ownerLang, entryTitle, commentBody, entryURL, s.cfg.PublicSiteURL, s.cfg.PublicSiteName)
+	s.emails.SendAsync(ctx, ownerEmail, email.NewCommentSubject(ownerLang), content)
+}
+
+func (s *Server) entryURL(entryID string) string {
+	base := strings.TrimRight(strings.TrimSpace(s.cfg.PublicSiteURL), "/")
+	if base == "" {
+		base = "https://yalinli.org"
+	}
+	return base + "/entries/" + strings.TrimSpace(entryID)
 }
 
 func (s *Server) handleMediaUpload() http.HandlerFunc {
@@ -1070,7 +1138,7 @@ func (s *Server) handleReport() http.HandlerFunc {
 			_, _ = s.db.Exec(r.Context(), `UPDATE comments SET status='reported',updated_at=now() WHERE id=$1`, tid)
 		}
 		if s.cfg.AdminContactEmail != "" {
-			s.emails.SendAsync(r.Context(), s.cfg.AdminContactEmail, "New report", "A content report was submitted.")
+			s.emails.SendAsync(r.Context(), s.cfg.AdminContactEmail, "New report", email.Content{Text: "A content report was submitted."})
 		}
 		response.JSON(w, http.StatusCreated, map[string]any{"ok": true})
 	}

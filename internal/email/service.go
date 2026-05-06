@@ -15,7 +15,12 @@ import (
 )
 
 type Sender interface {
-	SendAsync(ctx context.Context, to, subject, body string)
+	SendAsync(ctx context.Context, to, subject string, content Content)
+}
+
+type Content struct {
+	Text string
+	HTML string
 }
 
 type Service struct {
@@ -29,7 +34,7 @@ type Service struct {
 	jobs     chan job
 }
 
-type job struct{ to, subject, body string }
+type job struct{ to, subject, body, html string }
 
 func NewService(logger *slog.Logger, host string, port int, username, password, from, fromName string) *Service {
 	s := &Service{logger: logger, host: host, port: port, username: username, password: password, from: from, fromName: fromName, jobs: make(chan job, 200)}
@@ -37,9 +42,9 @@ func NewService(logger *slog.Logger, host string, port int, username, password, 
 	return s
 }
 
-func (s *Service) SendAsync(_ context.Context, to, subject, body string) {
+func (s *Service) SendAsync(_ context.Context, to, subject string, content Content) {
 	select {
-	case s.jobs <- job{to: to, subject: subject, body: body}:
+	case s.jobs <- job{to: to, subject: subject, body: content.Text, html: content.HTML}:
 	default:
 		s.logger.Warn("email queue full")
 	}
@@ -47,7 +52,7 @@ func (s *Service) SendAsync(_ context.Context, to, subject, body string) {
 
 func (s *Service) worker() {
 	for j := range s.jobs {
-		if err := s.SendSync(j.to, j.subject, j.body); err != nil {
+		if err := s.SendSync(j.to, j.subject, Content{Text: j.body, HTML: j.html}); err != nil {
 			s.logger.Error("email send failed", "to", j.to, "error", err.Error())
 			continue
 		}
@@ -55,7 +60,7 @@ func (s *Service) worker() {
 	}
 }
 
-func (s *Service) SendSync(to, subject, body string) error {
+func (s *Service) SendSync(to, subject string, content Content) error {
 	if strings.TrimSpace(s.host) == "" {
 		return errors.New("SMTP_HOST is empty")
 	}
@@ -69,6 +74,7 @@ func (s *Service) SendSync(to, subject, body string) error {
 	if fromAddr == "" {
 		fromAddr = strings.TrimSpace(s.username)
 	}
+	heloName := heloDomain(fromAddr)
 	replyTo := ""
 	if fromAddr != s.username && !strings.Contains(strings.ToLower(fromAddr), strings.ToLower(s.username)) {
 		replyTo = fromAddr
@@ -86,10 +92,27 @@ func (s *Service) SendSync(to, subject, body string) error {
 	msg.WriteString("Auto-Submitted: auto-generated\r\n")
 	msg.WriteString("X-Auto-Response-Suppress: All\r\n")
 	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
-	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
-	msg.WriteString("\r\n")
-	msg.WriteString(body)
+	if strings.TrimSpace(content.HTML) != "" {
+		boundary := fmt.Sprintf("yalinli-%d", time.Now().UnixNano())
+		msg.WriteString(fmt.Sprintf("Content-Type: multipart/alternative; boundary=\"%s\"\r\n", boundary))
+		msg.WriteString("\r\n")
+		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+		msg.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+		msg.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
+		msg.WriteString(content.Text)
+		msg.WriteString("\r\n")
+		msg.WriteString(fmt.Sprintf("--%s\r\n", boundary))
+		msg.WriteString("Content-Type: text/html; charset=\"utf-8\"\r\n")
+		msg.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
+		msg.WriteString(content.HTML)
+		msg.WriteString("\r\n")
+		msg.WriteString(fmt.Sprintf("--%s--\r\n", boundary))
+	} else {
+		msg.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+		msg.WriteString("Content-Transfer-Encoding: 8bit\r\n")
+		msg.WriteString("\r\n")
+		msg.WriteString(content.Text)
+	}
 
 	addr := net.JoinHostPort(s.host, fmt.Sprintf("%d", s.port))
 	conn, err := net.Dial("tcp", addr)
@@ -104,7 +127,7 @@ func (s *Service) SendSync(to, subject, body string) error {
 	}
 	defer client.Close()
 
-	if err = client.Hello("localhost"); err != nil {
+	if err = client.Hello(heloName); err != nil {
 		return fmt.Errorf("SMTP HELO failed: %w", err)
 	}
 
@@ -159,4 +182,12 @@ func sanitizeMessageIDLocal(v string) string {
 		return "mail"
 	}
 	return b.String()
+}
+
+func heloDomain(fromAddr string) string {
+	addr := strings.TrimSpace(strings.ToLower(fromAddr))
+	if at := strings.LastIndex(addr, "@"); at != -1 && at+1 < len(addr) {
+		return addr[at+1:]
+	}
+	return "localhost"
 }

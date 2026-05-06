@@ -27,6 +27,8 @@ type Config struct {
 	ContentReviewMode        string
 	CurrentTermsVersion      string
 	CurrentPrivacyVersion    string
+	PublicSiteURL            string
+	PublicSiteName           string
 	EmailFrom                string
 	EmailFromName            string
 	SMTPHost                 string
@@ -77,6 +79,8 @@ func Load() (Config, error) {
 		ContentReviewMode:        getDefault("CONTENT_REVIEW_MODE", "auto_approve"),
 		CurrentTermsVersion:      getDefault("CURRENT_TERMS_VERSION", "2026-05-04-v1"),
 		CurrentPrivacyVersion:    getDefault("CURRENT_PRIVACY_VERSION", "2026-05-04-v1"),
+		PublicSiteURL:            getDefault("PUBLIC_SITE_URL", "https://yalinli.org"),
+		PublicSiteName:           getDefault("PUBLIC_SITE_NAME", "yalinli.org"),
 		EmailFrom:                getDefault("EMAIL_FROM", "noreply@example.com"),
 		EmailFromName:            getDefault("EMAIL_FROM_NAME", "Yalinli"),
 		SMTPHost:                 strings.TrimSpace(os.Getenv("SMTP_HOST")),
