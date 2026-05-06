@@ -19,6 +19,9 @@ Your yalinli.org login code is:
 
 This code is valid for %d minutes. If you did not request this email, you can safely ignore it.
 
+For a better Yalinli:
+https://yalinli.org
+
 yalinli.org
 Dosmealti / Antalya / Yalinli neighborhood platform`, code, ttlMinutes)
 	}
@@ -29,6 +32,9 @@ yalinli.org giris kodunuz:
 %s
 
 Bu kod %d dakika boyunca gecerlidir. Bu e-postayi siz talep etmediyseniz guvenle yok sayabilirsiniz.
+
+Daha iyi bir Yalinli icin:
+https://yalinli.org
 
 yalinli.org
 Dosemealti / Antalya / Yalinli mahalle platformu`, code, ttlMinutes)
@@ -46,6 +52,9 @@ Bu yalinli.org API tarafindan gonderilen test e-postasidir.
 Hello,
 
 This is a test email sent by the yalinli.org API.
+
+For a better Yalinli:
+https://yalinli.org
 
 yalinli.org`
 }
