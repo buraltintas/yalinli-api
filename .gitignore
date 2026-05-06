@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+
+api
+bin/
+
+var/
+tmp/
+
+.DS_Store
