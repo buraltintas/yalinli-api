@@ -112,12 +112,10 @@ func lang(r *http.Request) string { return middleware.LangFrom(r.Context()) }
 func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Email                     string  `json:"email"`
-			FullName                  string  `json:"fullName"`
-			Name                      string  `json:"name"`
-			DisplayName               *string `json:"displayName"`
-			PreferredLanguage         string  `json:"preferredLanguage"`
-			EmailNotificationsEnabled *bool   `json:"emailNotificationsEnabled"`
+			Email                     string `json:"email"`
+			Name                      string `json:"name"`
+			PreferredLanguage         string `json:"preferredLanguage"`
+			EmailNotificationsEnabled *bool  `json:"emailNotificationsEnabled"`
 		}
 		if !decodeJSON(w, r, &in) {
 			return
@@ -127,11 +125,8 @@ func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 			badInput(w, r, "invalid_input")
 			return
 		}
-		fullName := strings.TrimSpace(in.FullName)
-		if fullName == "" {
-			fullName = strings.TrimSpace(in.Name)
-		}
-		if fullName == "" || len([]rune(fullName)) > 160 {
+		name := strings.TrimSpace(in.Name)
+		if name == "" || len([]rune(name)) > 160 {
 			badInput(w, r, "invalid_input")
 			return
 		}
@@ -153,7 +148,7 @@ func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 			response.Error(w, http.StatusConflict, "user_already_exists", i18n.Message(lang(r), "user_already_exists"))
 			return
 		}
-		if _, err := s.db.Exec(r.Context(), `INSERT INTO users(email,full_name,display_name,preferred_language,email_notifications_enabled) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, em, fullName, in.DisplayName, preferredLanguage, emailNotificationsEnabled); err != nil {
+		if _, err := s.db.Exec(r.Context(), `INSERT INTO users(email,full_name,preferred_language,email_notifications_enabled) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`, em, name, preferredLanguage, emailNotificationsEnabled); err != nil {
 			internalErr(w, r)
 			return
 		}
@@ -280,12 +275,11 @@ func (s *Server) handleLogout() http.HandlerFunc {
 func (s *Server) handleMe() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := middleware.UserIDFrom(r.Context())
-		row := s.db.QueryRow(r.Context(), `SELECT id,email,full_name,display_name,preferred_language,email_notifications_enabled,notify_new_entries,notify_resolved_problems,notify_new_petitions,notify_new_events,notify_announcements FROM users WHERE id=$1`, uid)
+		row := s.db.QueryRow(r.Context(), `SELECT id,email,full_name,preferred_language,email_notifications_enabled,notify_new_entries,notify_resolved_problems,notify_new_petitions,notify_new_events,notify_announcements FROM users WHERE id=$1`, uid)
 		var out struct {
 			ID                        string  `json:"id"`
 			Email                     string  `json:"email"`
-			FullName                  *string `json:"fullName"`
-			DisplayName               *string `json:"displayName"`
+			Name                      *string `json:"name"`
 			PreferredLanguage         string  `json:"preferredLanguage"`
 			EmailNotificationsEnabled bool    `json:"emailNotificationsEnabled"`
 			NotifyNewEntries          bool    `json:"notifyNewEntries"`
@@ -294,7 +288,7 @@ func (s *Server) handleMe() http.HandlerFunc {
 			NotifyNewEvents           bool    `json:"notifyNewEvents"`
 			NotifyAnnouncements       bool    `json:"notifyAnnouncements"`
 		}
-		if err := row.Scan(&out.ID, &out.Email, &out.FullName, &out.DisplayName, &out.PreferredLanguage, &out.EmailNotificationsEnabled, &out.NotifyNewEntries, &out.NotifyResolvedProblems, &out.NotifyNewPetitions, &out.NotifyNewEvents, &out.NotifyAnnouncements); err != nil {
+		if err := row.Scan(&out.ID, &out.Email, &out.Name, &out.PreferredLanguage, &out.EmailNotificationsEnabled, &out.NotifyNewEntries, &out.NotifyResolvedProblems, &out.NotifyNewPetitions, &out.NotifyNewEvents, &out.NotifyAnnouncements); err != nil {
 			internalErr(w, r)
 			return
 		}
@@ -305,9 +299,7 @@ func (s *Server) handlePatchMe() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := middleware.UserIDFrom(r.Context())
 		var in struct {
-			FullName                  *string `json:"fullName"`
 			Name                      *string `json:"name"`
-			DisplayName               *string `json:"displayName"`
 			PreferredLanguage         *string `json:"preferredLanguage"`
 			EmailNotificationsEnabled *bool   `json:"emailNotificationsEnabled"`
 		}
@@ -318,15 +310,11 @@ func (s *Server) handlePatchMe() http.HandlerFunc {
 			badInput(w, r, "invalid_input")
 			return
 		}
-		fullName := in.FullName
-		if fullName == nil {
-			fullName = in.Name
-		}
-		if fullName != nil && (strings.TrimSpace(*fullName) == "" || len([]rune(strings.TrimSpace(*fullName))) > 160) {
+		if in.Name != nil && (strings.TrimSpace(*in.Name) == "" || len([]rune(strings.TrimSpace(*in.Name))) > 160) {
 			badInput(w, r, "invalid_input")
 			return
 		}
-		_, err := s.db.Exec(r.Context(), `UPDATE users SET full_name=COALESCE($2,full_name), display_name=COALESCE($3,display_name), preferred_language=COALESCE($4,preferred_language), email_notifications_enabled=COALESCE($5,email_notifications_enabled), updated_at=now() WHERE id=$1`, uid, fullName, in.DisplayName, in.PreferredLanguage, in.EmailNotificationsEnabled)
+		_, err := s.db.Exec(r.Context(), `UPDATE users SET full_name=COALESCE($2,full_name), preferred_language=COALESCE($3,preferred_language), email_notifications_enabled=COALESCE($4,email_notifications_enabled), updated_at=now() WHERE id=$1`, uid, in.Name, in.PreferredLanguage, in.EmailNotificationsEnabled)
 		if err != nil {
 			internalErr(w, r)
 			return
