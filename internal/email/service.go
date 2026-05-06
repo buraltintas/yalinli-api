@@ -91,7 +91,7 @@ func (s *Service) SendSync(to, subject, body string) error {
 	msg.WriteString("\r\n")
 	msg.WriteString(body)
 
-	addr := fmt.Sprintf("%s:%d", s.host, s.port)
+	addr := net.JoinHostPort(s.host, fmt.Sprintf("%d", s.port))
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SMTP server: %w", err)

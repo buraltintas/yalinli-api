@@ -5,7 +5,7 @@ Go backend API for the Döşemealtı / Antalya / Yalınlı neighborhood platform
 ## Quick Start
 
 1. Copy `.env.example` to `.env` and fill required values.
-2. Start PostgreSQL.
+2. Configure a real PostgreSQL connection such as Neon in `DATABASE_URL` with SSL enabled.
 3. Run migrations: `make migrate-up`
 4. Run API: `make run`
 
@@ -53,6 +53,8 @@ See [docs/architecture.md](/Users/burakaltintas/Documents/yalinli-api/docs/archi
 All `/v1/*` endpoints require header:
 
 `X-BFF-SECRET: <BFF_SECRET>`
+
+Use a long random value and keep it only in the BFF/API runtime environment. Do not expose it to browsers or commit it to git.
 
 ## Main Endpoints
 

@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"log/slog"
 	"net"
 	"net/http"
@@ -60,9 +62,11 @@ func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 }
 
 func BFFSecret(secret string) func(http.Handler) http.Handler {
+	secretHash := sha256.Sum256([]byte(strings.TrimSpace(secret)))
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.TrimSpace(r.Header.Get("X-BFF-SECRET")) != secret {
+			gotHash := sha256.Sum256([]byte(strings.TrimSpace(r.Header.Get("X-BFF-SECRET"))))
+			if subtle.ConstantTimeCompare(gotHash[:], secretHash[:]) != 1 {
 				response.Error(w, http.StatusForbidden, "forbidden", i18n.Message(LangFrom(r.Context()), "forbidden"))
 				return
 			}
@@ -80,7 +84,7 @@ func RequireAuth(tokens *auth.TokenManager) func(http.Handler) http.Handler {
 				return
 			}
 			claims, err := tokens.Parse(strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")))
-			if err != nil {
+			if err != nil || claims.TokenType != "access" {
 				response.Error(w, http.StatusUnauthorized, "unauthorized", i18n.Message(LangFrom(r.Context()), "unauthorized"))
 				return
 			}
@@ -103,7 +107,7 @@ func CORS(allowed []string) func(http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-BFF-SECRET,X-Request-ID")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS")
-			if r.Method == http.MethodOptions {
+			if r.Method == http.MethodOptions && !strings.HasPrefix(r.URL.Path, "/v1/") {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}

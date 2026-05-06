@@ -57,7 +57,7 @@ func NewRouterWithStore(cfg config.Config, logger *slog.Logger, db *pgxpool.Pool
 		})
 		v1.Post("/auth/signup/request-code", s.rateByIP(rate.Every(time.Minute/time.Duration(max(cfg.RateLimitOTPPerMin, 1))), cfg.RateLimitOTPPerMin, s.handleSignupRequestCode()))
 		v1.Post("/auth/login/request-code", s.rateByIP(rate.Every(time.Minute/time.Duration(max(cfg.RateLimitOTPPerMin, 1))), cfg.RateLimitOTPPerMin, s.handleLoginRequestCode()))
-		v1.Post("/auth/verify-code", s.handleVerifyCode())
+		v1.Post("/auth/verify-code", s.rateByIP(rate.Every(time.Minute/5), 5, s.handleVerifyCode()))
 		v1.Post("/auth/refresh", s.handleRefresh())
 		v1.Post("/auth/logout", s.handleLogout())
 		v1.Post("/unsubscribe", s.handleUnsubscribe())
@@ -109,6 +109,47 @@ func contentDefaultStatus(mode string) string {
 }
 func lang(r *http.Request) string { return middleware.LangFrom(r.Context()) }
 
+var allowedEntryTypes = map[string]bool{
+	"problem":          true,
+	"beauty":           true,
+	"request":          true,
+	"suggestion":       true,
+	"event":            true,
+	"resolved_problem": true,
+	"announcement":     true,
+}
+
+var allowedReportTargets = map[string]bool{"entry": true, "comment": true, "media": true}
+var allowedReportReasons = map[string]bool{
+	"personal_data":        true,
+	"insult_or_defamation": true,
+	"privacy":              true,
+	"false_information":    true,
+	"spam":                 true,
+	"violence_or_threat":   true,
+	"copyright":            true,
+	"other":                true,
+}
+
+func validDisplayName(v *string) bool {
+	if v == nil {
+		return true
+	}
+	return len([]rune(strings.TrimSpace(*v))) <= 80
+}
+
+func validOptionalEmail(v *string) bool {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return true
+	}
+	return validation.ValidateEmail(validation.NormalizeEmail(*v)) == nil
+}
+
+func validCategory(v string) bool {
+	n := len([]rune(strings.TrimSpace(v)))
+	return n > 0 && n <= 80
+}
+
 func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
@@ -152,7 +193,10 @@ func (s *Server) handleSignupRequestCode() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
-		s.issueCode(r.Context(), em, "signup", preferredLanguage)
+		if err := s.issueCode(r.Context(), em, "signup", preferredLanguage); err != nil {
+			internalErr(w, r)
+			return
+		}
 		response.JSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -176,17 +220,29 @@ func (s *Server) handleLoginRequestCode() http.HandlerFunc {
 			response.Error(w, http.StatusNotFound, "user_not_found", i18n.Message(lang(r), "user_not_found"))
 			return
 		}
-		s.issueCode(r.Context(), em, "login", lang(r))
+		if err := s.issueCode(r.Context(), em, "login", lang(r)); err != nil {
+			internalErr(w, r)
+			return
+		}
 		response.JSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
 
-func (s *Server) issueCode(ctx context.Context, emailAddr, purpose, lang string) {
-	code, _ := auth.GenerateNumericCode()
-	hashed, _ := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+func (s *Server) issueCode(ctx context.Context, emailAddr, purpose, lang string) error {
+	code, err := auth.GenerateNumericCode()
+	if err != nil {
+		return err
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
 	expires := time.Now().UTC().Add(time.Duration(s.cfg.OTPCodeTTLMinutes) * time.Minute)
-	_, _ = s.db.Exec(ctx, `INSERT INTO auth_codes(email,purpose,code_hash,expires_at,max_attempts) VALUES($1,$2,$3,$4,$5)`, emailAddr, purpose, string(hashed), expires, s.cfg.OTPMaxAttempts)
+	if _, err := s.db.Exec(ctx, `INSERT INTO auth_codes(email,purpose,code_hash,expires_at,max_attempts) VALUES($1,$2,$3,$4,$5)`, emailAddr, purpose, string(hashed), expires, s.cfg.OTPMaxAttempts); err != nil {
+		return err
+	}
 	s.emails.SendAsync(ctx, emailAddr, email.LoginCodeSubject(lang), email.LoginCodeBody(lang, code, s.cfg.OTPCodeTTLMinutes))
+	return nil
 }
 
 func (s *Server) handleVerifyCode() http.HandlerFunc {
@@ -200,7 +256,13 @@ func (s *Server) handleVerifyCode() http.HandlerFunc {
 			return
 		}
 		em := validation.NormalizeEmail(in.Email)
-		row := s.db.QueryRow(r.Context(), `SELECT id,code_hash,expires_at,attempt_count,max_attempts,consumed_at FROM auth_codes WHERE email=$1 AND purpose=$2 ORDER BY created_at DESC LIMIT 1`, em, strings.TrimSpace(in.Purpose))
+		purpose := strings.TrimSpace(in.Purpose)
+		code := strings.TrimSpace(in.Code)
+		if validation.ValidateEmail(em) != nil || (purpose != "signup" && purpose != "login") || len(code) != 6 {
+			response.Error(w, http.StatusUnauthorized, "unauthorized", i18n.Message(lang(r), "unauthorized"))
+			return
+		}
+		row := s.db.QueryRow(r.Context(), `SELECT id,code_hash,expires_at,attempt_count,max_attempts,consumed_at FROM auth_codes WHERE email=$1 AND purpose=$2 ORDER BY created_at DESC LIMIT 1`, em, purpose)
 		var id uuid.UUID
 		var codeHash string
 		var expires time.Time
@@ -214,7 +276,7 @@ func (s *Server) handleVerifyCode() http.HandlerFunc {
 			response.Error(w, http.StatusUnauthorized, "unauthorized", i18n.Message(lang(r), "unauthorized"))
 			return
 		}
-		if err := bcrypt.CompareHashAndPassword([]byte(codeHash), []byte(strings.TrimSpace(in.Code))); err != nil {
+		if err := bcrypt.CompareHashAndPassword([]byte(codeHash), []byte(code)); err != nil {
 			_, _ = s.db.Exec(r.Context(), `UPDATE auth_codes SET attempt_count=attempt_count+1 WHERE id=$1`, id)
 			response.Error(w, http.StatusUnauthorized, "unauthorized", i18n.Message(lang(r), "unauthorized"))
 			return
@@ -371,7 +433,12 @@ func (s *Server) handleCreateEntry() http.HandlerFunc {
 			response.Error(w, http.StatusBadRequest, "terms_not_accepted", i18n.Message(lang(r), "terms_not_accepted"))
 			return
 		}
-		if strings.TrimSpace(in.Title) == "" || len([]rune(in.Title)) > 160 || strings.TrimSpace(in.Description) == "" || len([]rune(in.Description)) > 4000 || !validation.ValidLang(in.Language) {
+		in.Type = strings.TrimSpace(in.Type)
+		in.Category = strings.TrimSpace(in.Category)
+		in.Title = strings.TrimSpace(in.Title)
+		in.Description = strings.TrimSpace(in.Description)
+		in.Language = strings.TrimSpace(in.Language)
+		if !allowedEntryTypes[in.Type] || !validCategory(in.Category) || in.Title == "" || len([]rune(in.Title)) > 160 || in.Description == "" || len([]rune(in.Description)) > 4000 || !validation.ValidLang(in.Language) || !validDisplayName(in.DisplayName) || !validOptionalEmail(in.ContactEmail) {
 			badInput(w, r, "invalid_input")
 			return
 		}
@@ -486,7 +553,7 @@ func anonymousLabel(l string, ts time.Time) string {
 func (s *Server) handleGetEntry() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
-		row := s.db.QueryRow(r.Context(), `SELECT id,type,category,title,description,language,status,display_name,is_anonymous,created_at FROM entries WHERE id=$1`, id)
+		row := s.db.QueryRow(r.Context(), `SELECT id,type,category,title,description,language,status,display_name,is_anonymous,created_at FROM entries WHERE id=$1 AND status IN ('approved','reported')`, id)
 		var outID, outType, outCategory, outTitle, outDescription, outLanguage, outStatus string
 		var name *string
 		var isAnon bool
@@ -526,7 +593,7 @@ func (s *Server) handleGetEntry() http.HandlerFunc {
 func (s *Server) handleGetComments() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
-		rows, err := s.db.Query(r.Context(), `SELECT id,body,language,display_name,is_anonymous,created_at,status FROM comments WHERE entry_id=$1 AND status IN ('approved','reported') ORDER BY created_at ASC`, id)
+		rows, err := s.db.Query(r.Context(), `SELECT c.id,c.body,c.language,c.display_name,c.is_anonymous,c.created_at,c.status FROM comments c JOIN entries e ON e.id=c.entry_id WHERE c.entry_id=$1 AND c.status IN ('approved','reported') AND e.status IN ('approved','reported') ORDER BY c.created_at ASC`, id)
 		if err != nil {
 			internalErr(w, r)
 			return
@@ -566,8 +633,16 @@ func (s *Server) handleCreateComment() http.HandlerFunc {
 			response.Error(w, http.StatusBadRequest, "terms_not_accepted", i18n.Message(lang(r), "terms_not_accepted"))
 			return
 		}
-		if strings.TrimSpace(in.Body) == "" || len([]rune(in.Body)) > 2000 || !validation.ValidLang(in.Language) {
+		in.Body = strings.TrimSpace(in.Body)
+		in.Language = strings.TrimSpace(in.Language)
+		if in.Body == "" || len([]rune(in.Body)) > 2000 || !validation.ValidLang(in.Language) || !validDisplayName(in.DisplayName) {
 			badInput(w, r, "invalid_input")
+			return
+		}
+		var entryVisible bool
+		_ = s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM entries WHERE id=$1 AND status IN ('approved','reported'))`, eid).Scan(&entryVisible)
+		if !entryVisible {
+			response.Error(w, http.StatusNotFound, "not_found", "not found")
 			return
 		}
 		uid, ok := middleware.UserIDFrom(r.Context())
@@ -609,7 +684,11 @@ func (s *Server) handleMediaUpload() http.HandlerFunc {
 			return
 		}
 		ext := validation.ExtensionFromMIME(mimeType)
-		objectName := storage.RandomObjectName(s.cfg.GCSUploadPrefix, ext)
+		objectName, err := storage.RandomObjectName(s.cfg.GCSUploadPrefix, ext)
+		if err != nil {
+			internalErr(w, r)
+			return
+		}
 		up, err := s.store.UploadImage(r.Context(), objectName, mimeType, data)
 		if err != nil {
 			internalErr(w, r)
@@ -673,6 +752,14 @@ func (s *Server) handleCreatePetition() http.HandlerFunc {
 			response.Error(w, http.StatusBadRequest, "terms_not_accepted", i18n.Message(lang(r), "terms_not_accepted"))
 			return
 		}
+		in.Category = strings.TrimSpace(in.Category)
+		in.Title = strings.TrimSpace(in.Title)
+		in.Description = strings.TrimSpace(in.Description)
+		in.Language = strings.TrimSpace(in.Language)
+		if !validCategory(in.Category) || in.Title == "" || len([]rune(in.Title)) > 160 || in.Description == "" || len([]rune(in.Description)) > 4000 || !validation.ValidLang(in.Language) {
+			badInput(w, r, "invalid_input")
+			return
+		}
 		status := contentDefaultStatus(s.cfg.ContentReviewMode)
 		tx, err := s.db.Begin(r.Context())
 		if err != nil {
@@ -721,7 +808,7 @@ func (s *Server) handlePetitions() http.HandlerFunc {
 func (s *Server) handlePetition() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
-		row := s.db.QueryRow(r.Context(), `SELECT p.id,e.title,e.description,p.signature_count,p.status,e.created_at FROM petitions p JOIN entries e ON e.id=p.entry_id WHERE p.id=$1 AND p.status NOT IN ('hidden','deleted')`, id)
+		row := s.db.QueryRow(r.Context(), `SELECT p.id,e.title,e.description,p.signature_count,p.status,e.created_at FROM petitions p JOIN entries e ON e.id=p.entry_id WHERE p.id=$1 AND p.status IN ('approved','closed')`, id)
 		var pid, title, desc, status string
 		var count int
 		var created time.Time
@@ -753,16 +840,23 @@ func (s *Server) handleSignPetition() http.HandlerFunc {
 		uid, _ := middleware.UserIDFrom(r.Context())
 		pid := chi.URLParam(r, "id")
 		var in struct {
-			Visibility    string
-			TermsAccepted bool
-			FullName      string
+			Visibility             string `json:"visibility"`
+			SignatureTermsAccepted bool   `json:"signatureTermsAccepted"`
+			TermsAccepted          bool   `json:"termsAccepted"`
+			FullName               string `json:"fullName"`
+			UpdateProfileFullName  bool   `json:"updateProfileFullName"`
 		}
 		if !decodeJSON(w, r, &in) {
 			return
 		}
-		if !in.TermsAccepted {
+		termsAccepted := in.SignatureTermsAccepted || in.TermsAccepted
+		if !termsAccepted {
 			response.Error(w, http.StatusBadRequest, "terms_not_accepted", i18n.Message(lang(r), "terms_not_accepted"))
 			return
+		}
+		in.Visibility = strings.TrimSpace(in.Visibility)
+		if in.Visibility == "" {
+			in.Visibility = "anonymous"
 		}
 		if in.Visibility != "public_name" && in.Visibility != "anonymous" {
 			badInput(w, r, "invalid_input")
@@ -774,7 +868,7 @@ func (s *Server) handleSignPetition() http.HandlerFunc {
 			return
 		}
 		if pStatus != "approved" {
-			response.Error(w, http.StatusBadRequest, "invalid_input", "petition not signable")
+			response.Error(w, http.StatusBadRequest, "invalid_input", i18n.Message(lang(r), "invalid_input"))
 			return
 		}
 		tx, err := s.db.Begin(r.Context())
@@ -793,16 +887,19 @@ func (s *Server) handleSignPetition() http.HandlerFunc {
 		if fullName == "" && profileName != nil {
 			fullName = strings.TrimSpace(*profileName)
 		}
-		if fullName == "" {
+		if fullName == "" || len([]rune(fullName)) > 160 {
 			badInput(w, r, "invalid_input")
 			return
+		}
+		if in.UpdateProfileFullName {
+			_, _ = tx.Exec(r.Context(), `UPDATE users SET full_name=$2,updated_at=now() WHERE id=$1`, uid, fullName)
 		}
 		signedAt := time.Now().UTC()
 		masked := maskFullName(fullName, lang(r))
 		sigHash := makeSignatureHash(s.cfg.SignatureHashSecret, pid, uid, signedAt, email, s.cfg.CurrentTermsVersion)
 		_, err = tx.Exec(r.Context(), `INSERT INTO petition_signatures(petition_id,user_id,visibility,terms_accepted_at,terms_version,signer_full_name_snapshot,signer_email_snapshot,masked_signer_name,signed_at,signature_hash,updated_at) VALUES($1,$2,$3,now(),$4,$5,$6,$7,$8,$9,now())`, pid, uid, in.Visibility, s.cfg.CurrentTermsVersion, fullName, email, masked, signedAt, sigHash)
 		if err != nil {
-			response.Error(w, http.StatusConflict, "PETITION_ALREADY_SIGNED", "already signed")
+			response.Error(w, http.StatusConflict, "PETITION_ALREADY_SIGNED", i18n.Message(lang(r), "invalid_input"))
 			return
 		}
 		_, err = tx.Exec(r.Context(), `UPDATE petitions SET signature_count=signature_count+1,updated_at=now() WHERE id=$1`, pid)
@@ -810,7 +907,10 @@ func (s *Server) handleSignPetition() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
-		_ = tx.Commit(r.Context())
+		if err := tx.Commit(r.Context()); err != nil {
+			internalErr(w, r)
+			return
+		}
 		response.JSON(w, http.StatusCreated, map[string]any{"ok": true})
 	}
 }
@@ -818,13 +918,33 @@ func (s *Server) handleUnsignPetition() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := middleware.UserIDFrom(r.Context())
 		pid := chi.URLParam(r, "id")
-		tx, _ := s.db.Begin(r.Context())
+		tx, err := s.db.Begin(r.Context())
+		if err != nil {
+			internalErr(w, r)
+			return
+		}
 		defer tx.Rollback(r.Context())
-		tag, _ := tx.Exec(r.Context(), `DELETE FROM petition_signatures WHERE petition_id=$1 AND user_id=$2`, pid, uid)
+		var pStatus string
+		if err := tx.QueryRow(r.Context(), `SELECT status FROM petitions WHERE id=$1`, pid).Scan(&pStatus); err != nil {
+			response.Error(w, http.StatusNotFound, "not_found", "not found")
+			return
+		}
+		if pStatus == "closed" || pStatus == "hidden" || pStatus == "deleted" {
+			response.Error(w, http.StatusForbidden, "forbidden", i18n.Message(lang(r), "forbidden"))
+			return
+		}
+		tag, err := tx.Exec(r.Context(), `DELETE FROM petition_signatures WHERE petition_id=$1 AND user_id=$2`, pid, uid)
+		if err != nil {
+			internalErr(w, r)
+			return
+		}
 		if tag.RowsAffected() > 0 {
 			_, _ = tx.Exec(r.Context(), `UPDATE petitions SET signature_count=GREATEST(signature_count-1,0),updated_at=now() WHERE id=$1`, pid)
 		}
-		_ = tx.Commit(r.Context())
+		if err := tx.Commit(r.Context()); err != nil {
+			internalErr(w, r)
+			return
+		}
 		response.JSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -927,7 +1047,9 @@ func (s *Server) handleReport() http.HandlerFunc {
 		if !decodeJSON(w, r, &in) {
 			return
 		}
-		if in.TargetType == "" || in.TargetID == "" || in.Reason == "" {
+		in.TargetType = strings.TrimSpace(in.TargetType)
+		in.Reason = strings.TrimSpace(in.Reason)
+		if !allowedReportTargets[in.TargetType] || !allowedReportReasons[in.Reason] || strings.TrimSpace(in.TargetID) == "" || !validOptionalEmail(in.ReporterEmail) {
 			badInput(w, r, "invalid_input")
 			return
 		}
@@ -958,6 +1080,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, out any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(out); err != nil {
+		response.Error(w, http.StatusBadRequest, "invalid_input", "invalid input")
+		return false
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		response.Error(w, http.StatusBadRequest, "invalid_input", "invalid input")
 		return false
 	}

@@ -93,14 +93,16 @@ func (l *LocalStore) SignedGetURL(_ context.Context, _ string, objectName string
 	return fmt.Sprintf("%s/%s", l.publicBaseURL, strings.TrimLeft(objectName, "/")), nil
 }
 
-func RandomObjectName(prefix, ext string) string {
+func RandomObjectName(prefix, ext string) (string, error) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
 	safePrefix := strings.Trim(strings.TrimSpace(prefix), "/")
 	if safePrefix == "" {
 		safePrefix = "yalinli"
 	}
-	return fmt.Sprintf("%s/%s%s", safePrefix, hex.EncodeToString(b), ext)
+	return fmt.Sprintf("%s/%s%s", safePrefix, hex.EncodeToString(b), ext), nil
 }
 
 func EncodeStorageRef(bucket, objectName string) string {
