@@ -36,6 +36,9 @@ type Server struct {
 	tokens *auth.TokenManager
 	emails *email.Service
 	store  storage.Store
+	// Where the homepage feed is kept between writes; nil keeps it in the
+	// database only.
+	snapshots storage.ObjectStore
 }
 
 func NewRouter(cfg config.Config, logger *slog.Logger, db *pgxpool.Pool) http.Handler {
@@ -45,6 +48,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, db *pgxpool.Pool) http.Ha
 
 func NewRouterWithStore(cfg config.Config, logger *slog.Logger, db *pgxpool.Pool, st storage.Store) http.Handler {
 	s := &Server{cfg: cfg, logger: logger, db: db, tokens: auth.NewTokenManager(cfg.JWTSecret, config.AccessTTL(cfg), config.RefreshTTL(cfg)), emails: email.NewService(logger, cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.EmailFrom, cfg.EmailFromName), store: st}
+	if objects, ok := st.(storage.ObjectStore); ok && cfg.FeedSnapshotMaxAge > 0 {
+		s.snapshots = objects
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.LanguageResolver(cfg.DefaultLanguage), middleware.Logging(logger), middleware.Recover(logger), middleware.CORS(cfg.CORSAllowedOrigins), middleware.MaxBodyBytes(cfg.MaxBodyBytes))
 	if cfg.StorageBackend == "local" {
@@ -486,6 +492,7 @@ func (s *Server) handleCreateEntry() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
+		s.refreshFeedSnapshot(r.Context())
 		if status == "approved" {
 			s.notifyNewEntry(r.Context(), id, in.Title, in.Description, userID)
 		}
@@ -495,56 +502,102 @@ func (s *Server) handleCreateEntry() http.HandlerFunc {
 
 func (s *Server) handleFeed() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		q := `SELECT e.id,e.type,e.category,e.title,left(e.description,280),e.language,e.status,e.display_name,e.is_anonymous,e.created_at,(SELECT COUNT(*) FROM comments c WHERE c.entry_id=e.id AND c.status IN ('approved','reported')),COALESCE((SELECT array_agg(m.url ORDER BY m.created_at ASC) FROM media m WHERE m.entry_id=e.id AND m.status='approved'),ARRAY[]::text[]) FROM entries e WHERE e.status IN ('approved','reported')`
-		args := []any{}
-		if t := strings.TrimSpace(r.URL.Query().Get("type")); t != "" {
-			args = append(args, t)
-			q += fmt.Sprintf(" AND e.type=$%d", len(args))
+		entryType := strings.TrimSpace(r.URL.Query().Get("type"))
+		category := strings.TrimSpace(r.URL.Query().Get("category"))
+		language := strings.TrimSpace(r.URL.Query().Get("lang"))
+		var rows []feedRow
+		var err error
+		source := "db"
+		if entryType == "" && category == "" && language == "" && s.snapshots != nil {
+			rows, source, err = s.snapshotFeed(r.Context())
+		} else {
+			rows, err = s.queryFeed(r.Context(), entryType, category, language)
 		}
-		if c := strings.TrimSpace(r.URL.Query().Get("category")); c != "" {
-			args = append(args, c)
-			q += fmt.Sprintf(" AND e.category=$%d", len(args))
-		}
-		if l := strings.TrimSpace(r.URL.Query().Get("lang")); l != "" {
-			args = append(args, l)
-			q += fmt.Sprintf(" AND e.language=$%d", len(args))
-		}
-		q += " ORDER BY e.created_at DESC LIMIT 50"
-		rows, err := s.db.Query(r.Context(), q, args...)
 		if err != nil {
 			internalErr(w, r)
 			return
 		}
-		defer rows.Close()
-		type item struct {
-			ID, Type, Category, Title, DescriptionPreview, Language, Status, AuthorDisplay string
-			CreatedAt                                                                      time.Time
-			CommentCount                                                                   int
-			ImageURLs                                                                      []string `json:"imageUrls"`
-		}
-		out := []item{}
-		for rows.Next() {
-			var it item
-			var name *string
-			var isAnon bool
-			var images []string
-			if err := rows.Scan(&it.ID, &it.Type, &it.Category, &it.Title, &it.DescriptionPreview, &it.Language, &it.Status, &name, &isAnon, &it.CreatedAt, &it.CommentCount, &images); err != nil {
-				internalErr(w, r)
-				return
-			}
-			it.ImageURLs = s.resolveImageRefs(r.Context(), images)
-			if isAnon {
-				it.AuthorDisplay = anonymousLabel(lang(r), it.CreatedAt)
-			} else if name != nil {
-				it.AuthorDisplay = strings.TrimSpace(*name)
-			}
-			if it.AuthorDisplay == "" {
-				it.AuthorDisplay = "Yalinli User"
-			}
-			out = append(out, it)
-		}
-		response.JSON(w, http.StatusOK, map[string]any{"items": out})
+		s.logger.Info("feed", "request_id", middleware.RequestIDFrom(r.Context()), "feed_source", source)
+		response.JSON(w, http.StatusOK, map[string]any{"items": s.feedItems(r, rows)})
 	}
+}
+
+type feedRow struct {
+	ID                 string    `json:"id"`
+	Type               string    `json:"type"`
+	Category           string    `json:"category"`
+	Title              string    `json:"title"`
+	DescriptionPreview string    `json:"descriptionPreview"`
+	Language           string    `json:"language"`
+	Status             string    `json:"status"`
+	DisplayName        *string   `json:"displayName,omitempty"`
+	IsAnonymous        bool      `json:"isAnonymous"`
+	CreatedAt          time.Time `json:"createdAt"`
+	CommentCount       int       `json:"commentCount"`
+	ImageRefs          []string  `json:"imageRefs"`
+}
+
+type feedItem struct {
+	ID, Type, Category, Title, DescriptionPreview, Language, Status, AuthorDisplay string
+	CreatedAt                                                                      time.Time
+	CommentCount                                                                   int
+	ImageURLs                                                                      []string `json:"imageUrls"`
+}
+
+func (s *Server) queryFeed(ctx context.Context, entryType, category, language string) ([]feedRow, error) {
+	q := `SELECT e.id,e.type,e.category,e.title,left(e.description,280),e.language,e.status,e.display_name,e.is_anonymous,e.created_at,(SELECT COUNT(*) FROM comments c WHERE c.entry_id=e.id AND c.status IN ('approved','reported')),COALESCE((SELECT array_agg(m.url ORDER BY m.created_at ASC) FROM media m WHERE m.entry_id=e.id AND m.status='approved'),ARRAY[]::text[]) FROM entries e WHERE e.status IN ('approved','reported')`
+	args := []any{}
+	if entryType != "" {
+		args = append(args, entryType)
+		q += fmt.Sprintf(" AND e.type=$%d", len(args))
+	}
+	if category != "" {
+		args = append(args, category)
+		q += fmt.Sprintf(" AND e.category=$%d", len(args))
+	}
+	if language != "" {
+		args = append(args, language)
+		q += fmt.Sprintf(" AND e.language=$%d", len(args))
+	}
+	q += " ORDER BY e.created_at DESC LIMIT 50"
+	rows, err := s.db.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []feedRow{}
+	for rows.Next() {
+		var row feedRow
+		if err := rows.Scan(&row.ID, &row.Type, &row.Category, &row.Title, &row.DescriptionPreview, &row.Language, &row.Status, &row.DisplayName, &row.IsAnonymous, &row.CreatedAt, &row.CommentCount, &row.ImageRefs); err != nil {
+			return nil, err
+		}
+		if row.IsAnonymous {
+			row.DisplayName = nil
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Server) feedItems(r *http.Request, rows []feedRow) []feedItem {
+	out := make([]feedItem, 0, len(rows))
+	for _, row := range rows {
+		it := feedItem{ID: row.ID, Type: row.Type, Category: row.Category, Title: row.Title, DescriptionPreview: row.DescriptionPreview, Language: row.Language, Status: row.Status, CreatedAt: row.CreatedAt, CommentCount: row.CommentCount}
+		it.ImageURLs = s.resolveImageRefs(r.Context(), row.ImageRefs)
+		if row.IsAnonymous {
+			it.AuthorDisplay = anonymousLabel(lang(r), row.CreatedAt)
+		} else if row.DisplayName != nil {
+			it.AuthorDisplay = strings.TrimSpace(*row.DisplayName)
+		}
+		if it.AuthorDisplay == "" {
+			it.AuthorDisplay = "Yalinli User"
+		}
+		out = append(out, it)
+	}
+	return out
 }
 
 func anonymousLabel(l string, ts time.Time) string {
@@ -661,6 +714,7 @@ func (s *Server) handleCreateComment() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
+		s.refreshFeedSnapshot(r.Context())
 		if status == "approved" {
 			s.notifyEntryComment(r.Context(), eid, in.Body, userID)
 		}
@@ -851,6 +905,7 @@ func (s *Server) handleCreatePetition() http.HandlerFunc {
 			internalErr(w, r)
 			return
 		}
+		s.refreshFeedSnapshot(r.Context())
 		response.JSON(w, http.StatusCreated, map[string]any{"id": pid, "status": status})
 	}
 }
@@ -1135,6 +1190,7 @@ func (s *Server) handleReport() http.HandlerFunc {
 		}
 		if in.TargetType == "entry" {
 			_, _ = s.db.Exec(r.Context(), `UPDATE entries SET status='reported',updated_at=now() WHERE id=$1`, tid)
+			s.refreshFeedSnapshot(r.Context())
 		}
 		if in.TargetType == "comment" {
 			_, _ = s.db.Exec(r.Context(), `UPDATE comments SET status='reported',updated_at=now() WHERE id=$1`, tid)

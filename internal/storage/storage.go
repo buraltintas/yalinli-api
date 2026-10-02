@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"google.golang.org/api/googleapi"
 )
 
 type UploadResult struct {
@@ -25,6 +28,24 @@ type UploadResult struct {
 type Store interface {
 	UploadImage(ctx context.Context, objectName, mimeType string, data []byte) (UploadResult, error)
 	SignedGetURL(ctx context.Context, bucket, objectName string, ttl time.Duration) (string, error)
+}
+
+// ErrGenerationMismatch means the object changed after it was read, so the
+// write that wanted to replace that version was refused.
+var ErrGenerationMismatch = errors.New("storage: object changed since it was read")
+
+// ObjectStore keeps small private files next to the uploads. Only the GCS
+// store has one; callers find it with a type assertion and do without it
+// otherwise.
+type ObjectStore interface {
+	// ReadObject returns the object and its generation, or generation 0 and no
+	// error when there is no such object.
+	ReadObject(ctx context.Context, name string) ([]byte, int64, error)
+	// WriteObject replaces the object only if it is still at generation, and
+	// with generation 0 only if there is none yet. Otherwise it returns
+	// ErrGenerationMismatch and leaves the object alone.
+	WriteObject(ctx context.Context, name, contentType string, data []byte, generation int64) error
+	DeleteObject(ctx context.Context, name string) error
 }
 
 type GCSStore struct {
@@ -66,6 +87,49 @@ func (s *GCSStore) SignedGetURL(_ context.Context, bucket, objectName string, tt
 		return "", err
 	}
 	return u, nil
+}
+
+func (s *GCSStore) ReadObject(ctx context.Context, name string) ([]byte, int64, error) {
+	r, err := s.client.Bucket(s.bucket).Object(name).NewReader(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, r.Attrs.Generation, nil
+}
+
+func (s *GCSStore) WriteObject(ctx context.Context, name, contentType string, data []byte, generation int64) error {
+	cond := storage.Conditions{DoesNotExist: true}
+	if generation != 0 {
+		cond = storage.Conditions{GenerationMatch: generation}
+	}
+	w := s.client.Bucket(s.bucket).Object(name).If(cond).NewWriter(ctx)
+	w.ContentType = contentType
+	if _, err := w.Write(data); err != nil {
+		_ = w.Close()
+		return err
+	}
+	err := w.Close()
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return ErrGenerationMismatch
+	}
+	return err
+}
+
+func (s *GCSStore) DeleteObject(ctx context.Context, name string) error {
+	err := s.client.Bucket(s.bucket).Object(name).Delete(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (s *GCSStore) Close() error { return s.client.Close() }

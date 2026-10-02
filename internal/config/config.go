@@ -45,6 +45,7 @@ type Config struct {
 	GCSBucket                string
 	GCSUploadPrefix          string
 	GCSSignedURLTTL          time.Duration
+	FeedSnapshotMaxAge       time.Duration
 	StorageLocalDir          string
 	MediaPublicBaseURL       string
 	AdminContactEmail        string
@@ -97,6 +98,7 @@ func Load() (Config, error) {
 		GCSBucket:                getDefault("GCS_BUCKET", ""),
 		GCSUploadPrefix:          getDefault("GCS_UPLOAD_PREFIX", "yalinli"),
 		GCSSignedURLTTL:          parseDurationDefault("GCS_SIGNED_URL_TTL", 24*time.Hour),
+		FeedSnapshotMaxAge:       parseDurationDefault("FEED_SNAPSHOT_MAX_AGE", 6*time.Hour),
 		StorageLocalDir:          getDefault("STORAGE_LOCAL_DIR", "./var/storage"),
 		MediaPublicBaseURL:       getDefault("MEDIA_PUBLIC_BASE_URL", "http://localhost:8080/public/media"),
 		AdminContactEmail:        strings.TrimSpace(os.Getenv("ADMIN_CONTACT_EMAIL")),
