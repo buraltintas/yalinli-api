@@ -120,12 +120,13 @@ Priority:
 ## Homepage Feed Snapshot
 
 - The unfiltered `GET /v1/feed` (no `type`, `category` or `lang`) is served from `gs://$GCS_BUCKET/_cache/feed-v1.json` so that bots on the homepage do not wake the database.
-- Creating an entry, comment or petition and reporting an entry rebuild it before the response.
+- Creating an entry, comment or petition and reporting an entry or comment rebuild it before the response; if that rebuild fails, the copy is deleted so the next read rebuilds it.
 - A copy older than `FEED_SNAPSHOT_MAX_AGE` (optional, default `6h`) is rebuilt from the database on the next read; `0` turns the snapshot off.
 - If the object cannot be read, the feed comes from the database as before; if the database cannot be reached when it is due, the old copy is served.
 - It holds storage refs, not signed URLs, and no names for anonymous entries.
 - Changes made by hand in SQL (hiding or deleting a post) reach the homepage only at the next rebuild, up to `FEED_SNAPSHOT_MAX_AGE` later; the entry page changes at once. To update the homepage at once, delete the copy:
   - `gcloud storage rm gs://yalinli-images-a1b2c3/_cache/feed-v1.json --project yalinli`
+- After a rollback to a revision without the snapshot, run the same command when rolling forward again: writes made on the old revision did not rebuild the copy.
 - Database-backed tests run only with `YALINLI_TEST_DATABASE_URL` pointing at a throwaway local Postgres (they migrate and empty it); never the `.env` database.
 
 ## Updated Implementation Plan (Petitions & Signatures)

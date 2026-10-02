@@ -177,6 +177,19 @@ func TestFeedSnapshotMatchesDatabaseAndFollowsWrites(t *testing.T) {
 		t.Fatalf("reported status not refreshed: %v", it)
 	}
 
+	// Reporting a comment hidden by hand counts it again.
+	var hiddenID string
+	if err := pool.QueryRow(ctx, `INSERT INTO comments(entry_id,body,language,status,terms_accepted_at,terms_version) VALUES($1,'Gizlenen','tr','hidden',now(),'v1') RETURNING id`, entryID).Scan(&hiddenID); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := send(t, h, http.MethodPost, "/v1/reports", `{"targetType":"comment","targetId":"`+hiddenID+`","reason":"spam"}`, ""); code != http.StatusCreated {
+		t.Fatalf("comment report: %d %v", code, out)
+	}
+	_, body = getFeed(t, h, "", "")
+	if it := feedItemByID(t, body, entryID); it["CommentCount"] != float64(2) {
+		t.Fatalf("comment count not refreshed after a comment report: %v", it)
+	}
+
 	var userID string
 	if err := pool.QueryRow(ctx, `INSERT INTO users(email,full_name) VALUES('dilekce@example.test','Test Kullanıcı') RETURNING id`).Scan(&userID); err != nil {
 		t.Fatal(err)
@@ -242,5 +255,25 @@ func TestOlderRebuildCannotReplaceNewerSnapshot(t *testing.T) {
 	s.refreshFeedSnapshot(context.Background())
 	if snap, ok := st.snapshot(t); !ok || len(snap.Items) != 1 || snap.Items[0].Title != "Yol çukuru" {
 		t.Fatalf("refresh after a write did not land: %+v", snap.Items)
+	}
+}
+
+func TestRefreshDeletesSnapshotWhenWriteStalls(t *testing.T) {
+	pool := testDatabase(t)
+	seedEntry(t, pool, "Yol çukuru", nil, false, time.Now().UTC())
+	st := newMemStore()
+	st.put(t, sampleSnapshot(time.Now().UTC()))
+	st.stallWrites = true
+	s := &Server{cfg: testConfig(), logger: discardLogger(), db: pool, store: st, snapshots: st}
+
+	// A store that stops answering mid-write, as during a run of 503s, must
+	// still leave no copy behind that lacks the write.
+	start := time.Now()
+	s.refreshFeedSnapshot(context.Background())
+	if _, ok := st.snapshot(t); ok {
+		t.Fatalf("stale snapshot survived a refresh whose write stalled")
+	}
+	if took := time.Since(start); took > 2*feedSnapshotTimeout {
+		t.Fatalf("refresh held the write for %s", took)
 	}
 }

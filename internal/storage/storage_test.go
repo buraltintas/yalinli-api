@@ -2,8 +2,11 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -21,6 +24,8 @@ type fakeGCS struct {
 	mu   sync.Mutex
 	data []byte
 	gen  int64
+	// failDeletes answers that many deletes with 503 first.
+	failDeletes int
 }
 
 func (f *fakeGCS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -62,9 +67,18 @@ func (f *fakeGCS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.data, _ = io.ReadAll(part)
 		f.gen++
+		sum := make([]byte, 4)
+		binary.BigEndian.PutUint32(sum, crc32.Checksum(f.data, crc32.MakeTable(crc32.Castagnoli)))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"bucket":"bucket","name":%q,"generation":"%d","metageneration":"1","size":"%d"}`, name, f.gen, len(f.data))
+		_, _ = fmt.Fprintf(w, `{"bucket":"bucket","name":%q,"generation":"%d","metageneration":"1","size":"%d","crc32c":%q}`, name, f.gen, len(f.data), base64.StdEncoding.EncodeToString(sum))
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/storage/v1/b/bucket/o/"):
+		if f.failDeletes > 0 {
+			f.failDeletes--
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":503,"message":"Backend Error"}}`)
+			return
+		}
 		if f.gen == 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
@@ -79,7 +93,8 @@ func (f *fakeGCS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestGCSObjectGenerations(t *testing.T) {
-	srv := httptest.NewServer(&fakeGCS{})
+	fake := &fakeGCS{}
+	srv := httptest.NewServer(fake)
 	defer srv.Close()
 	t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
 	ctx := context.Background()
@@ -112,8 +127,14 @@ func TestGCSObjectGenerations(t *testing.T) {
 	if data, gen, _ := st.ReadObject(ctx, name); gen != 2 || string(data) != `{"a":3}` {
 		t.Fatalf("after replace: %q %d", data, gen)
 	}
+	fake.mu.Lock()
+	fake.failDeletes = 2
+	fake.mu.Unlock()
 	if err := st.DeleteObject(ctx, name); err != nil {
-		t.Fatalf("delete: %v", err)
+		t.Fatalf("delete after two 503s: %v", err)
+	}
+	if _, gen, _ := st.ReadObject(ctx, name); gen != 0 {
+		t.Fatalf("object still there after delete: generation %d", gen)
 	}
 	if err := st.DeleteObject(ctx, name); err != nil {
 		t.Fatalf("delete of a missing object: %v", err)

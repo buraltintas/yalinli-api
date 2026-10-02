@@ -1194,6 +1194,7 @@ func (s *Server) handleReport() http.HandlerFunc {
 		}
 		if in.TargetType == "comment" {
 			_, _ = s.db.Exec(r.Context(), `UPDATE comments SET status='reported',updated_at=now() WHERE id=$1`, tid)
+			s.refreshFeedSnapshot(r.Context())
 		}
 		if s.cfg.AdminContactEmail != "" {
 			s.emails.SendAsync(r.Context(), s.cfg.AdminContactEmail, "New report", email.Content{Text: "A content report was submitted."})

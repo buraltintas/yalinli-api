@@ -28,6 +28,9 @@ type memObjects struct {
 	reads   int
 	writes  int
 	readErr error
+	// stallReads and stallWrites make those calls wait until their context
+	// ends, like a store that has stopped answering.
+	stallReads, stallWrites bool
 	// beforeWrite runs before a write is checked, so a test can change the
 	// object underneath it.
 	beforeWrite func(m *memObjects)
@@ -37,7 +40,11 @@ func newMemObjects() *memObjects {
 	return &memObjects{data: map[string][]byte{}, gen: map[string]int64{}}
 }
 
-func (m *memObjects) ReadObject(_ context.Context, name string) ([]byte, int64, error) {
+func (m *memObjects) ReadObject(ctx context.Context, name string) ([]byte, int64, error) {
+	if m.stallReads {
+		<-ctx.Done()
+		return nil, 0, ctx.Err()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.reads++
@@ -47,7 +54,11 @@ func (m *memObjects) ReadObject(_ context.Context, name string) ([]byte, int64, 
 	return m.data[name], m.gen[name], nil
 }
 
-func (m *memObjects) WriteObject(_ context.Context, name, _ string, data []byte, generation int64) error {
+func (m *memObjects) WriteObject(ctx context.Context, name, _ string, data []byte, generation int64) error {
+	if m.stallWrites {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if hook := m.beforeWrite; hook != nil {
 		m.beforeWrite = nil
 		hook(m)
@@ -64,7 +75,10 @@ func (m *memObjects) WriteObject(_ context.Context, name, _ string, data []byte,
 	return nil
 }
 
-func (m *memObjects) DeleteObject(_ context.Context, name string) error {
+func (m *memObjects) DeleteObject(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.data, name)
@@ -249,6 +263,22 @@ func TestRefreshDeletesSnapshotWhenDatabaseUnreachable(t *testing.T) {
 	s.refreshFeedSnapshot(context.Background())
 	if _, ok := st.snapshot(t); ok {
 		t.Fatalf("snapshot kept although it could not be rebuilt after a write")
+	}
+}
+
+func TestRefreshDeletesSnapshotWhenStoreStalls(t *testing.T) {
+	st := newMemStore()
+	st.put(t, sampleSnapshot(time.Now().UTC()))
+	st.stallReads = true
+	s := &Server{cfg: testConfig(), logger: discardLogger(), db: unreachablePool(t), store: st, snapshots: st}
+
+	start := time.Now()
+	s.refreshFeedSnapshot(context.Background())
+	if _, ok := st.snapshot(t); ok {
+		t.Fatalf("snapshot kept although the store stalled during the refresh")
+	}
+	if took := time.Since(start); took > 2*feedSnapshotTimeout {
+		t.Fatalf("refresh held the write for %s", took)
 	}
 }
 
